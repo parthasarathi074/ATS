@@ -1,4 +1,5 @@
 import io
+import logging
 import os
 import re
 import zipfile
@@ -11,6 +12,9 @@ from docx import Document as DocxDocument
 from PyPDF2 import PdfReader
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -161,41 +165,65 @@ def build_resume_report(filename: str, text: str, role: str) -> str:
     valid_urls = [u for u in urls if validate_url(u)]
     invalid_urls = [u for u in urls if not validate_url(u)]
 
+    lowered = text.lower()
+    present_sections = []
+    if re.search(r"\b(name|full name)\b", lowered):
+        present_sections.append("contact")
+    if re.search(r"\b(summary|profile|about me)\b", lowered):
+        present_sections.append("summary")
+    if re.search(r"\b(experience|work history|employment)\b", lowered):
+        present_sections.append("experience")
+    if re.search(r"\b(education|degree|university|college)\b", lowered):
+        present_sections.append("education")
+    if re.search(r"\b(skills|technologies|tools|languages)\b", lowered):
+        present_sections.append("skills")
+    if re.search(r"\b(project|projects|achievement|achievements)\b", lowered):
+        present_sections.append("projects")
+
+    strengths = [reason for reason in result["reasons"] if not reason.startswith("Contains") and not reason.startswith("Matches role")]
+    if not strengths:
+        strengths = ["The resume is concise and easy to scan."]
+
     lines = []
-    lines.append(f"Resume: {filename}")
+    lines.append("Resume review")
+    lines.append(f"File: {filename}")
     lines.append(f"Score: {result['score']}/100")
-    lines.append("Highlights:")
-    for reason in result["reasons"]:
-        lines.append(f"- {reason}")
+    lines.append("Status: " + ("promising" if result["score"] >= 70 else "needs refinement"))
+    if role:
+        lines.append(f"Focus role: {role}")
+    lines.append("")
+    lines.append("What stood out")
+    for item in strengths[:3]:
+        lines.append(f"• {item}")
 
     if result["grammar_issues"]:
-        lines.append("Grammar/clarity issues:")
-        for issue in result["grammar_issues"]:
-            lines.append(f"- {issue}")
+        lines.append("Language check: a few wording issues are worth revisiting.")
     else:
-        lines.append("Grammar/clarity: no obvious issues detected. No edit recommendation needed.")
+        lines.append("Language check: no obvious typo patterns were found.")
 
     if urls:
-        lines.append(f"URLs found: {len(urls)}")
+        lines.append(f"Links detected: {len(urls)}")
         if valid_urls:
-            lines.append(f"Valid URLs: {', '.join(valid_urls[:3])}")
+            lines.append(f"Working links: {', '.join(valid_urls[:2])}")
         if invalid_urls:
-            lines.append(f"Invalid URLs: {', '.join(invalid_urls)}")
+            lines.append(f"Needs review: {', '.join(invalid_urls[:2])}")
     else:
-        lines.append("URLs found: none")
+        lines.append("Links detected: none")
 
     improvements = suggest_improvements(text, role)
+    lines.append("")
+    lines.append("Best next step")
     if improvements:
-        lines.append("How to improve the score:")
-        for item in improvements:
-            lines.append(f"- {item}")
+        lines.append(f"• {improvements[0]}")
     else:
-        lines.append("How to improve the score: keep the resume focused and add measurable results.")
+        lines.append("• Make the achievements more measurable and specific.")
 
     platforms = suggest_platforms(text)
-    lines.append("Skill-building platforms:")
-    for platform in platforms:
-        lines.append(f"- {platform}")
+    if platforms:
+        lines.append("")
+        lines.append("Practice path")
+        for platform in platforms:
+            lines.append(f"→ {platform}")
 
     return "\n".join(lines)
 
@@ -217,7 +245,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
-    if not message.document:
+    logger.info('Received document message: %s', message)
+    if not message or not message.document:
+        logger.warning('Document handler called with no document')
         return
 
     caption = (message.caption or "").strip()
@@ -226,8 +256,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         role = caption.split("role:", 1)[1].strip()
 
     file = await message.document.get_file()
-    data = await file.download_as_bytes()
+    buffer = io.BytesIO()
+    await file.download_to_memory(buffer)
+    data = buffer.getvalue()
     filename = message.document.file_name or "resume"
+    logger.info('Downloading file: %s, size=%s', filename, len(data))
 
     try:
         if filename.lower().endswith(".zip"):
@@ -237,7 +270,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     if member.is_dir():
                         continue
                     name = member.filename.split("/")[-1]
-                    if os.path.splitext(name)[1].lower() not in SUPPORTED_EXTENSIONS:
+                    ext = os.path.splitext(name)[1].lower()
+                    if ext not in SUPPORTED_EXTENSIONS:
+                        logger.info('Skipping unsupported file inside zip: %s', name)
                         continue
                     text = extract_text_from_bytes(name, zf.read(member))
                     reports.append(build_resume_report(name, text, role))
@@ -251,6 +286,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         text = extract_text_from_bytes(filename, data)
         await message.reply_text(build_resume_report(filename, text, role))
     except Exception as exc:
+        logger.error('Error processing document: %s', exc, exc_info=True)
         await message.reply_text(f"I could not read that file. Error: {exc}")
 
 
@@ -268,7 +304,7 @@ def main() -> None:
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(MessageHandler(filters.document, handle_document))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     print("Bot is running...")
     app.run_polling()
